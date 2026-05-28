@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""
+factorio-mods - CLI tool to manage Factorio mods via the mod portal API.
+
+Usage:
+  factorio-mods search <query>          Search mods
+  factorio-mods install <name>...       Install mod(s)
+  factorio-mods remove <name>...        Remove mod(s)
+  factorio-mods list                    List installed mods
+  factorio-mods update                  Update all installed mods
+  factorio-mods sync <file>             Sync from mod-list.json
+
+Config: set MODS_DIR and TOKEN in the script or via environment variables.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
+import urllib.parse
+import zipfile
+from pathlib import Path
+
+# --- Default config ---
+# Set these via env vars or edit here
+MODS_DIR = os.getenv("FACTORIO_MODS_DIR", "")
+TOKEN = os.getenv("FACTORIO_TOKEN", "")
+USERNAME = os.getenv("FACTORIO_USERNAME", "dantesousa")
+SERVER_SETTINGS = os.getenv("FACTORIO_SETTINGS", "")
+API_BASE = "https://mods.factorio.com/api/mods"
+
+
+# --- Helpers ---
+
+def _api_get(path, params=None):
+    """Make a GET request to the mod portal API."""
+    url = f"{API_BASE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "factorio-mods-cli/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"  API error {e.code}: {e.reason}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"  Error: {e}", file=sys.stderr)
+        return None
+
+
+def _find_mods_dir():
+    """Auto-detect the mods directory."""
+    if MODS_DIR:
+        return Path(MODS_DIR)
+    # Default locations
+    candidates = [
+        Path.home() / "factorio/factorio/mods",
+        Path.home() / ".factorio/mods",
+        Path.home() / "factorio/mods",
+    ]
+    # Check if there's a factorio install nearby (VPS layout)
+    factorio_dir = Path.home() / "factorio/factorio"
+    if factorio_dir.exists():
+        candidates.insert(0, factorio_dir / "mods")
+    for c in candidates:
+        if c.exists():
+            return c
+    # Create default
+    default = Path.home() / "factorio/mods"
+    default.mkdir(parents=True, exist_ok=True)
+    return default
+
+
+def _get_mods_dir():
+    """Get mods directory, creating if needed."""
+    d = _find_mods_dir()
+    if not d.exists():
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _get_token():
+    """Get API token."""
+    t = TOKEN or os.getenv("FACTORIO_TOKEN", "")
+    if not t and SERVER_SETTINGS:
+        try:
+            with open(SERVER_SETTINGS) as f:
+                s = json.load(f)
+                t = s.get("token", "")
+        except:
+            pass
+    if not t:
+        print("ERROR: No Factorio API token set.", file=sys.stderr)
+        print("Set FACTORIO_TOKEN env var or put token in server-settings.json", file=sys.stderr)
+        sys.exit(1)
+    return t
+
+
+def _get_username():
+    """Get Factorio username."""
+    u = USERNAME or os.getenv("FACTORIO_USERNAME", "")
+    if not u and SERVER_SETTINGS:
+        try:
+            with open(SERVER_SETTINGS) as f:
+                s = json.load(f)
+                u = s.get("username", "")
+        except:
+            pass
+    return u or "dantesousa"
+
+
+def _parse_mod_filename(name):
+    """Parse mod name and version from filename (e.g. 'space-exploration_0.6.100.zip')."""
+    m = re.match(r"(.+?)_(\d+\.\d+\.\d+)\.zip", name)
+    if m:
+        return m.group(1), m.group(2)
+    # Handle no version (enabled/disabled marker like "space-exploration_0.6.100")
+    m = re.match(r"(.+?)_(\d+\.\d+\.\d+)", name)
+    if m:
+        return m.group(1), m.group(2)
+    return name, None
+
+
+def _read_mod_list(mods_dir):
+    """Read mod-list.json."""
+    path = mods_dir / "mod-list.json"
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except:
+            pass
+    return {"mods": []}
+
+
+def _write_mod_list(mods_dir, data):
+    """Write mod-list.json."""
+    path = mods_dir / "mod-list.json"
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _installed_mods(mods_dir):
+    """Get dict of installed mods: name -> {version, enabled, filepath}."""
+    mods = {}
+    for f in mods_dir.iterdir():
+        if f.suffix == ".zip" or (f.is_file() and not f.suffix):
+            name, ver = _parse_mod_filename(f.name)
+            if name:
+                mods[name] = {
+                    "version": ver or "?",
+                    "filepath": f,
+                    "filename": f.name,
+                }
+    # Read enabled status from mod-list.json
+    ml = _read_mod_list(mods_dir)
+    for entry in ml.get("mods", []):
+        mname = entry.get("name", "")
+        if mname in mods:
+            mods[mname]["enabled"] = entry.get("enabled", True)
+        # Also track disabled mods (not installed)
+        if mname not in mods and not entry.get("enabled", True):
+            mods[mname] = {"version": None, "filepath": None, "filename": None, "enabled": False}
+    return mods
+
+
+def _download_mod(mod_name, release, mods_dir, username, token, indent=""):
+    """Download a specific release of a mod."""
+    dl_url = release.get("download_url", "")
+    if not dl_url:
+        # Some API responses have it differently
+        dl_url = release.get("url", "")
+        if dl_url:
+            dl_url = dl_url.replace("/api/", "/")
+
+    if not dl_url.startswith("http"):
+        dl_url = f"https://mods.factorio.com{dl_url}"
+
+    # Add auth params
+    separator = "&" if "?" in dl_url else "?"
+    dl_url = f"{dl_url}{separator}username={username}&token={token}"
+
+    ver = release.get("version", "?")
+    filename = f"{mod_name}_{ver}.zip"
+    dest = mods_dir / filename
+
+    print(f"{indent}  Downloading {filename}...", end="", flush=True)
+    try:
+        req = urllib.request.Request(dl_url, headers={"User-Agent": "factorio-mods-cli/1.0"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = resp.read()
+        with open(dest, "wb") as f:
+            f.write(data)
+        # Verify it's a valid zip
+        with zipfile.ZipFile(dest) as zf:
+            if zf.testzip():
+                print(" CORRUPTED!")
+                dest.unlink()
+                return None
+        print(f" OK ({len(data)//1024}KB)")
+        return dest
+    except urllib.error.HTTPError as e:
+        print(f" HTTP {e.code}")
+        return None
+    except Exception as e:
+        print(f" Error: {e}")
+        return None
+
+
+def _search_mods(query, page_size=15):
+    """Search for mods on the portal."""
+    data = _api_get("", {"q": query, "page_size": page_size})
+    if not data:
+        return []
+    return data.get("results", data if isinstance(data, list) else [])
+
+
+def _get_mod_info(name):
+    """Get detailed info about a specific mod."""
+    return _api_get(f"/{urllib.parse.quote(name, safe='')}")
+
+
+def _get_latest_release(mod_data):
+    """Get the latest release for the current Factorio version."""
+    releases = mod_data.get("releases", [])
+    # Filter for the latest by sorting
+    if not releases:
+        return None
+    sorted_rel = sorted(releases, key=lambda r: [int(x) for x in r.get("version", "0.0.0").split(".")], reverse=True)
+    for rel in sorted_rel:
+        if rel.get("info_json", {}).get("factorio_version", "").startswith("2.0"):
+            return rel
+    # Fall back to any release
+    return sorted_rel[0] if sorted_rel else None
+
+
+def _get_active_releases(mod_data):
+    """Get all active releases."""
+    return [r for r in mod_data.get("releases", []) if r.get("released_at") and not r.get("hidden")]
+
+
+def _add_to_mod_list(mods_dir, name, enabled=True):
+    """Add a mod to mod-list.json."""
+    ml = _read_mod_list(mods_dir)
+    # Remove existing entry
+    ml["mods"] = [m for m in ml["mods"] if m.get("name") != name]
+    ml["mods"].append({"name": name, "enabled": enabled})
+    _write_mod_list(mods_dir, ml)
+
+
+def _remove_from_mod_list(mods_dir, name):
+    """Remove a mod from mod-list.json."""
+    ml = _read_mod_list(mods_dir)
+    ml["mods"] = [m for m in ml["mods"] if m.get("name") != name]
+    _write_mod_list(mods_dir, ml)
+
+
+def _get_dependencies(mod_data):
+    """Get list of required dependencies."""
+    deps = []
+    for rel in mod_data.get("releases", []):
+        for dep in rel.get("info_json", {}).get("dependencies", []):
+            dep = dep.strip()
+            # Skip base game and optional deps
+            if dep.startswith("? ") or dep.startswith("(?) "):
+                continue
+            if dep.startswith("base "):
+                continue
+            # Extract mod name (before version constraint)
+            parts = dep.split()
+            if parts:
+                deps.append(parts[0])
+        if deps:
+            break
+    return deps
+
+
+# --- Commands ---
+
+def cmd_search(args):
+    """Search for mods."""
+    query = " ".join(args.query)
+    print(f"Searching for '{query}'...")
+    results = _search_mods(query)
+    if not results:
+        print("No results found.")
+        return
+
+    for i, mod in enumerate(results, 1):
+        title = mod.get("title", mod.get("name", "?"))
+        name = mod.get("name", "?")
+        summary = mod.get("summary", "")
+        factorio_ver = mod.get("latest_release", {}).get("info_json", {}).get("factorio_version", "?")
+        downloads = mod.get("downloads_count", 0)
+        print(f"\n{i}. {title}")
+        print(f"   Name: {name}")
+        print(f"   Version: {factorio_ver}")
+        print(f"   Downloads: {downloads}")
+        if summary:
+            print(f"   {summary[:120]}")
+
+
+def cmd_install(args):
+    """Install mod(s)."""
+    mods_dir = _get_mods_dir()
+    token = _get_token()
+    username = _get_username()
+
+    for mod_name in args.names:
+        print(f"\nProcessing: {mod_name}")
+        info = _get_mod_info(mod_name)
+        if not info:
+            print(f"  Mod '{mod_name}' not found!")
+            continue
+
+        title = info.get("title", mod_name)
+
+        # Get dependencies first
+        deps = _get_dependencies(info)
+        if deps:
+            print(f"  Dependencies: {', '.join(deps)}")
+            for dep in deps:
+                dep_info = _get_mod_info(dep)
+                if not dep_info:
+                    print(f"  (dependency '{dep}' not found, skipping)")
+                    continue
+                installed = _installed_mods(mods_dir)
+                if dep not in installed:
+                    print(f"  Installing dependency: {dep}")
+                    dep_release = _get_latest_release(dep_info)
+                    if dep_release:
+                        _download_mod(dep, dep_release, mods_dir, username, token, indent="  ")
+                        _add_to_mod_list(mods_dir, dep, enabled=True)
+                        print(f"  ✓ {dep} installed")
+
+        # Download mod
+        release = _get_latest_release(info)
+        if not release:
+            print(f"  No suitable release found for '{mod_name}'")
+            continue
+
+        # Check if already installed
+        installed = _installed_mods(mods_dir)
+        if mod_name in installed:
+            curr_ver = installed[mod_name]["version"]
+            new_ver = release.get("version", "?")
+            if curr_ver == new_ver:
+                print(f"  Already installed ({curr_ver}), ensuring enabled...")
+                _add_to_mod_list(mods_dir, mod_name, enabled=True)
+                continue
+
+        dest = _download_mod(mod_name, release, mods_dir, username, token)
+        if dest:
+            _add_to_mod_list(mods_dir, mod_name, enabled=True)
+            print(f"  ✓ {title} installed!")
+
+
+def cmd_remove(args):
+    """Remove mod(s)."""
+    mods_dir = _get_mods_dir()
+    installed = _installed_mods(mods_dir)
+
+    for mod_name in args.names:
+        if mod_name not in installed:
+            print(f"'{mod_name}' is not installed.")
+            continue
+        fpath = installed[mod_name]["filepath"]
+        if fpath and fpath.exists():
+            fpath.unlink()
+            print(f"  Removed {fpath.name}")
+        _remove_from_mod_list(mods_dir, mod_name)
+        print(f"  ✓ {mod_name} removed")
+
+
+def cmd_list(args):
+    """List installed mods."""
+    mods_dir = _get_mods_dir()
+    installed = _installed_mods(mods_dir)
+    if not installed:
+        print("No mods installed.")
+        return
+
+    # Remove internal mods
+    print(f"Mods directory: {mods_dir}")
+    print(f"Total: {len(installed)} mod(s)\n")
+
+    for name, info in sorted(installed.items()):
+        en = "✓" if info.get("enabled", True) else "✗"
+        ver = info.get("version", "?")
+        fname = info.get("filename", "")
+        print(f"  [{en}] {name} {ver}")
+        if fname:
+            print(f"       {fname}")
+
+
+def cmd_update(args):
+    """Update all installed mods."""
+    mods_dir = _get_mods_dir()
+    token = _get_token()
+    username = _get_username()
+    installed = _installed_mods(mods_dir)
+
+    updated = 0
+    for name, info in sorted(installed.items()):
+        if not info["filepath"]:
+            continue
+        print(f"\nChecking {name} ({info['version']})...")
+        mod_info = _get_mod_info(name)
+        if not mod_info:
+            print("  Not found on portal, skipping")
+            continue
+        release = _get_latest_release(mod_info)
+        if not release:
+            continue
+        new_ver = release.get("version", "?")
+        if new_ver == info["version"]:
+            print("  Up to date")
+            continue
+        print(f"  Updating {info['version']} -> {new_ver}...")
+        # Remove old file
+        if info["filepath"].exists():
+            info["filepath"].unlink()
+        dest = _download_mod(name, release, mods_dir, username, token)
+        if dest:
+            updated += 1
+            print(f"  ✓ Updated")
+
+    if updated == 0:
+        print("\nAll mods up to date!")
+    else:
+        print(f"\n{updated} mod(s) updated.")
+
+
+def cmd_sync(args):
+    """Sync from a mod-list.json file (from local game)."""
+    src = Path(args.file)
+    if not src.exists():
+        print(f"File not found: {src}")
+        return
+
+    mods_dir = _get_mods_dir()
+    token = _get_token()
+    username = _get_username()
+
+    try:
+        with open(src) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Error reading {src}: {e}")
+        return
+
+    mod_entries = data.get("mods", [])
+    # Filter out base mods
+    to_install = [m for m in mod_entries if m.get("name") not in ("base", "elevated-rails", "quality", "space-age")]
+
+    if not to_install:
+        print("No mods to sync.")
+        return
+
+    installed = _installed_mods(mods_dir)
+    for entry in to_install:
+        name = entry["name"]
+        enabled = entry.get("enabled", True)
+        if name in installed:
+            print(f"  ✓ {name} already installed")
+            _add_to_mod_list(mods_dir, name, enabled=enabled)
+            continue
+        print(f"\n  Installing {name}...")
+        info = _get_mod_info(name)
+        if not info:
+            print(f"  '{name}' not found on portal, skipping")
+            continue
+        release = _get_latest_release(info)
+        if not release:
+            continue
+        _download_mod(name, release, mods_dir, username, token, indent="  ")
+        _add_to_mod_list(mods_dir, name, enabled=enabled)
+        print(f"  ✓ {name} installed")
+
+    print("\nSync complete!")
+
+
+def cmd_info(args):
+    """Show detailed info about a mod."""
+    info = _get_mod_info(args.name)
+    if not info:
+        print(f"Mod '{args.name}' not found.")
+        return
+
+    print(f"\n=== {info.get('title', args.name)} ===")
+    print(f"  Name: {info.get('name')}")
+    print(f"  Summary: {info.get('summary', 'N/A')}")
+    print(f"  Downloads: {info.get('downloads_count', 0)}")
+    print(f"  License: {info.get('license', {}).get('name', '?')}")
+    print(f"  Owner: {info.get('owner', '?')}")
+    print(f"  Factorio versions: {info.get('latest_release', {}).get('info_json', {}).get('factorio_version', '?')}")
+
+    releases = info.get("releases", [])
+    if releases:
+        print(f"\n  Releases ({len(releases)}):")
+        for rel in sorted(releases, key=lambda r: r.get("released_at", ""), reverse=True)[:5]:
+            ver = rel.get("version", "?")
+            released = rel.get("released_at", "?")[:10]
+            fv = rel.get("info_json", {}).get("factorio_version", "?")
+            print(f"    {ver} (factorio {fv}) - {released}")
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Manage Factorio mods via the mod portal API.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  factorio-mods search space-exploration
+  factorio-mods install space-exploration krastorio-2
+  factorio-mods remove space-exploration
+  factorio-mods list
+  factorio-mods update
+  factorio-mods sync ~/.factorio/mods/mod-list.json
+  factorio-mods info space-exploration
+
+Config:
+  FACTORIO_TOKEN    API token from https://factorio.com/profile
+  FACTORIO_USERNAME Your Factorio.com username
+  FACTORIO_MODS_DIR Path to mods directory (auto-detected)
+        """
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_search = sub.add_parser("search", help="Search mods on the portal")
+    p_search.add_argument("query", nargs="+", help="Search query")
+
+    p_install = sub.add_parser("install", help="Install mod(s)")
+    p_install.add_argument("names", nargs="+", help="Mod name(s) to install")
+
+    p_remove = sub.add_parser("remove", help="Remove mod(s)")
+    p_remove.add_argument("names", nargs="+", help="Mod name(s) to remove")
+
+    p_list = sub.add_parser("list", help="List installed mods")
+
+    p_update = sub.add_parser("update", help="Update all installed mods")
+
+    p_sync = sub.add_parser("sync", help="Sync from a mod-list.json file")
+    p_sync.add_argument("file", help="Path to mod-list.json")
+
+    p_info = sub.add_parser("info", help="Show mod details")
+    p_info.add_argument("name", help="Mod name")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    commands = {
+        "search": cmd_search,
+        "install": cmd_install,
+        "remove": cmd_remove,
+        "list": cmd_list,
+        "update": cmd_update,
+        "sync": cmd_sync,
+        "info": cmd_info,
+    }
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
