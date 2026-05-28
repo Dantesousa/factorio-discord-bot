@@ -43,52 +43,10 @@ O bot usa **duas abordagens** para se comunicar com o Factorio:
 ```
 factorio-discord-bot/
 ├── bot.py              # Bot principal (discord.py)
-├── factorio-mods       # CLI gerenciador de mods
 ├── .env                # Configurações (NÃO versionar)
 ├── .env.example        # Template de configuração
 └── README.md           # Este arquivo
 ```
-
-## 🎮 Gerenciador de Mods (`factorio-mods`)
-
-CLI pra gerenciar mods via API do portal da Factorio.
-
-### Configuração
-
-1. Gere um token em https://factorio.com/profile (seção API)
-2. Defina como variável de ambiente:
-
-```bash
-export FACTORIO_TOKEN=seu_token_aqui
-export FACTORIO_USERNAME=seu_usuario
-```
-
-### Comandos
-
-```bash
-# Instalar mod(s)
-factorio-mods install space-exploration Krastorio2
-
-# Remover mod(s)
-factorio-mods remove space-exploration
-
-# Listar mods instalados
-factorio-mods list
-
-# Atualizar todos os mods
-factorio-mods update
-
-# Sincronizar com seu jogo local
-factorio-mods sync ~/.factorio/mods/mod-list.json
-
-# Ver info de um mod
-factorio-mods info Krastorio2
-
-# Buscar mods
-factorio-mods search krastorio
-```
-
-**Dica:** O token é o mesmo do `server-settings.json`. Se já configurou lá, o script detecta automaticamente.
 
 ## Configuração
 
